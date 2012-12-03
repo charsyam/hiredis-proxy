@@ -4,7 +4,7 @@
 
 #include "proxy.h"
 
-#define SERVER_COUNT    2
+#define SERVER_COUNT    3
 int main(void) {
     unsigned int j;
     redisReply *reply;
@@ -12,7 +12,8 @@ int main(void) {
 
     redisAddr addrs[SERVER_COUNT] = {
         { "127.0.0.1", 2000 },
-        { "127.0.0.1", 2001 }
+        { "127.0.0.1", 2001 },
+        { "127.0.0.1", 2002 }
     };
 
     p = proxyConnect( addrs, SERVER_COUNT );
@@ -35,8 +36,32 @@ int main(void) {
     printf("SET: %s\n", reply->str);
     freeReplyObject(reply);
 
+    reply = proxyCommand( p,"SET %s %s", "foo1", "hello");
+    printf("SET: %s\n", reply->str);
+    freeReplyObject(reply);
+
+    reply = proxyCommand( p,"SET %s %s", "foo2", "hello");
+    printf("SET: %s\n", reply->str);
+    freeReplyObject(reply);
+
+    reply = proxyCommand( p,"SET %s %s", "foo3", "hello");
+    printf("SET: %s\n", reply->str);
+    freeReplyObject(reply);
+
     reply = proxyCommand( p, "SET %b %b", "bar", 3, "hello", 5);
     printf("SET (binary API): %s\n", reply->str);
+    freeReplyObject(reply);
+
+    reply = proxyCommand(p,"GET foo1");
+    printf("GET foo: %s\n", reply->str);
+    freeReplyObject(reply);
+
+    reply = proxyCommand(p,"GET foo2");
+    printf("GET foo: %s\n", reply->str);
+    freeReplyObject(reply);
+
+    reply = proxyCommand(p,"GET foo3");
+    printf("GET foo: %s\n", reply->str);
     freeReplyObject(reply);
 
     reply = proxyCommand(p,"GET foo");

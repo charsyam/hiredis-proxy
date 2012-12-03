@@ -5,28 +5,13 @@
 #include    "sds.h"
 #include    "dict.h"
 #include    "proxy.h"
+#include    "md5.h"
 
 #define PROXY_NOTUSED(V) ((void) V)
 
-typedef struct multiRequestInfo{
-    int request_count;
-    int *server_array;
-    int command_count;
-    int *command_idx;
-}multiRequestInfo;
-
-typedef struct multiRequest {
-    int idx;
-    int argc;
-    char **argv;
-}multiRequest;
-
 struct redisKeyInfo;
-struct multiRequest;
 
 typedef void *redisCommandProc(proxyContext *p, int argc, char **argv, struct redisKeyInfo *keyInfo);
-typedef void *redisPostProc(proxyContext *p, multiRequest *requests, int argc, char **argv, 
-                   struct multiRequestInfo info);
 
 typedef struct redisKeyInfo {
     const char *name;
@@ -35,7 +20,7 @@ typedef struct redisKeyInfo {
     int lastkey;
     int keystep;
     int flags;
-    redisPostProc *postproc;
+    int reserved;
 }redisKeyInfo;
 
 unsigned int dictSdsCaseHash(const void *key) {
@@ -60,21 +45,25 @@ void dictSdsDestructor(void *privdata, void *val)
     sdsfree(val);
 }
 
-redisContext *getRedisContext( proxyContext *p, int idx ) {
-    redisContext *c = NULL;
-    if( p ){
-        c = p->contexts[idx];
-    }
-
-    return c;
-}
-
 static void freeProxyCommand( int argc, char **argv ) {
     for( int i = 0; i < argc; i++ ) {
         sdsfree(argv[i]);
     }
 
     free(argv);
+}
+
+static void adjustClosedConnections( proxyContext *p, redisContext *c ) {
+    if( c == NULL )
+        return;
+
+    for( int i = 0; i < p->max_count; i++ ) {
+        if( p->contexts[i] == c ) {
+            redisFree(p->contexts[i]);
+            p->contexts[i] = NULL;
+            break;
+        }
+    }
 }
 
 static proxyContext *proxyContextInit(int count) {
@@ -84,21 +73,81 @@ static proxyContext *proxyContextInit(int count) {
     if (p == NULL)
         return NULL;
 
-    p->count = count;
+    p->max_count = count;
     p->contexts = calloc(count, sizeof(redisContext *));
+    p->mcs_count = count * 160;
+    p->mcs = calloc(p->mcs_count*160, sizeof(ketamaMCS));
     return p;
 }
 
 void destroyProxyContext(proxyContext *p) {
     if( p ) {
-        for( int i = 0; i < p->count; i++ ) {
+        for( int i = 0; i < p->max_count; i++ ) {
             if( p->contexts[i] ) {
                 redisFree(p->contexts[i]);
             }
         }
 
+        if( p->mcs ){
+            free(p->mcs);
+        }
+
         free(p);
     }
+}
+
+void ketama_md5_digest( const char* inString, unsigned char md5pword[16] )
+{
+    md5_state_t md5state;
+
+    md5_init( &md5state );
+    md5_append( &md5state, (unsigned char *)inString, strlen( inString ) );
+    md5_finish( &md5state, md5pword );
+}
+
+int ketama_compare( ketamaMCS *a, ketamaMCS *b )
+{
+    return ( a->point < b->point ) ?  -1 : ( ( a->point > b->point ) ? 1 : 0 );
+}
+
+void sortContinuum( proxyContext *p, int cont ) {
+    p->mcs_count = cont;
+    qsort( (void*) p->mcs, cont, sizeof(ketamaMCS), (__compar_fn_t)ketama_compare );
+    for( int i = 0; i < cont; i++ ){
+        printf("(%d) (%s:%d)(%u:%x)\n", i, p->mcs[i].ip, p->mcs[i].port, p->mcs[i].point, *(p->mcs[i].c) );
+    }
+}
+
+int createContinuum( proxyContext *p, redisAddr *addr, redisContext **c, int cont ) {
+    float pct = ((float)1/p->max_count);
+    unsigned int ks = floorf( pct * 40.0 * (float)p->max_count );
+    
+    for( unsigned int k = 0; k < ks; k++ )
+    {
+        /* 40 hashes, 4 numbers per hash = 160 points per server */
+        char ss[128];
+        unsigned char digest[16];
+
+        sprintf( ss, "%s:%d-%d", addr->ip, addr->port, k );
+        ketama_md5_digest( ss, digest );
+
+        /* Use successive 4-bytes from hash as numbers
+         * for the points on the circle: */
+        for( int h = 0; h < 4; h++ )
+        {
+            p->mcs[cont].point = ( digest[3+h*4] << 24 )
+                | ( digest[2+h*4] << 16 )
+                | ( digest[1+h*4] <<  8 )
+                |   digest[h*4];
+
+            p->mcs[cont].c = c;
+            p->mcs[cont].ip = addr->ip;
+            p->mcs[cont].port = addr->port;
+            cont++;
+        }
+    }
+
+    return cont;
 }
 
 proxyContext *proxyConnect( redisAddr *addrs, int count ) {
@@ -106,21 +155,87 @@ proxyContext *proxyConnect( redisAddr *addrs, int count ) {
     if( p == NULL )
         return NULL;
 
+    p->count = 0;
+    int cont = 0;
     for( int i = 0; i < count; i++ ) {
-        p->contexts[i] = redisConnect(addrs[i].ip, addrs[i].port);
-        if( p->contexts[i] == NULL ) {
-            printf("Error: %s[%d]\n", addrs[i].ip, addrs[i].port);
-            destroyProxyContext(p);
-            return NULL;
-        }
+        redisContext *c = redisConnect(addrs[i].ip, addrs[i].port);
+        if( c == NULL ) {
+            printf("Connection Error: %s[%d]\n", addrs[i].ip, addrs[i].port);
+        } 
+        p->contexts[p->count++] = c;
+        cont = createContinuum( p, &addrs[i], &(p->contexts[i]), cont);
+    }
+
+    sortContinuum( p, cont );
+
+    if( p->count == 0 ){
+        printf("No Connections\n");
+        destroyProxyContext(p); 
     }
 
     return p;
 }
 
-static int lookupRedisServerWithKey( char *key, int size ) {
-    int hash = dictCaseHash( key ); 
-    return hash%size;
+unsigned int ketama_hashi( const char* key)
+{
+    unsigned char digest[16];
+
+    ketama_md5_digest( key, digest );
+    return (unsigned int)(( digest[3] << 24 )
+            | ( digest[2] << 16 )
+            | ( digest[1] <<  8 )
+            |   digest[0] );
+}
+
+redisContext *getFirstContext( proxyContext *p, int idx ) {
+    printf("key index: %d\n", idx);
+    for ( int i = idx; i < p->mcs_count; i++ ){
+        if( p->mcs[i].c != NULL )
+            return *(p->mcs[i].c);
+    }
+
+    if( idx > 0 ){
+        for( int i = 0; i < idx; i++ ) {
+            if( p->mcs[i].c != NULL )
+                return *(p->mcs[i].c);
+        }
+    }
+
+    return NULL;
+}
+
+redisContext *lookupRedisServerWithKey( proxyContext *p, const char *key ) {
+    unsigned int h = ketama_hashi( key );
+    int highp = p->mcs_count-1;
+    int lowp = 0, midp;
+    unsigned int midval, midval1;
+
+    ketamaMCS *mcs = p->mcs;
+    while ( lowp < highp )
+    {
+        midp = (int)( ( lowp+highp ) / 2 );
+        midval = mcs[midp].point;
+        midval1 = (midp == 0) ? 0 : mcs[midp-1].point;
+
+        if ( h <= midval && h > midval1 )
+            return getFirstContext(p, midp);
+
+        if ( midval < h )
+            lowp = midp + 1;
+        else
+            highp = midp - 1;
+    }
+
+    return getFirstContext(p, lowp);
+}
+
+redisContext *getRedisContextWithIdx( proxyContext *p, int idx ) {
+    redisContext *c = NULL;
+    if( p && p->contexts && p->max_count > idx ){
+        c = p->contexts[idx]; 
+    }
+
+    return c;
 }
 
 void *notsupportCommandProc(proxyContext *p, int argc, char **argv, redisKeyInfo *keyInfo) {
@@ -138,15 +253,23 @@ void *notsupportCommandProc(proxyContext *p, int argc, char **argv, redisKeyInfo
     return reply;
 }
 
+void *proxyCommandArgvList(proxyContext *p, redisContext *c, int argc, const char **argv) {
+    if( c == NULL )
+        return NULL;
+
+    void *reply = redisCommandArgvList( c, argc, (const char **)argv );
+    if( reply == NULL ){
+        adjustClosedConnections( p, c );
+    }
+
+    return reply;
+}
+
 void *oneKeyProc(proxyContext *p, int argc, char **argv, redisKeyInfo *keyInfo){
     PROXY_NOTUSED(keyInfo);
     redisContext *c;
-    int idx;
-    void *reply; 
-    idx = lookupRedisServerWithKey( argv[1], p->count );
-    c = getRedisContext( p, idx );
-    reply = redisCommandArgvList( c, argc, (const char **)argv );
-    return reply;
+    c = lookupRedisServerWithKey( p, argv[1] );
+    return proxyCommandArgvList( p, c, argc, (const char **)argv );
 }
 
 void printArgv( int argc, char **argv ){
@@ -156,15 +279,23 @@ void printArgv( int argc, char **argv ){
     }
 }
 
-void *msetPostProc(proxyContext *p, multiRequest *requests, int argc, char **argv, multiRequestInfo info) {
-    PROXY_NOTUSED(argc);
-    PROXY_NOTUSED(argv);
-
+void *msetProc(proxyContext *p, int argc, char **argv, redisKeyInfo *keyInfo){
+    int command_count = (argc-1)/keyInfo->keystep;
     redisReply *replyAll = NULL;
+
     int call_count = 0;
-    for( int i = 0; i < info.request_count; i++ ) {
-        redisContext *c = getRedisContext( p, requests[i].idx );
-        redisReply *reply = redisCommandArgvList( c, requests[i].argc, (const char **)requests[i].argv );
+    
+    char *myargv[3];
+    myargv[0] = (char *)"SET";
+
+    for( int i = 0; i < command_count; i++ ) {
+        int keyIdx = 1+(i*keyInfo->keystep);
+        char *key = argv[keyIdx];
+        char *value = argv[keyIdx+1];
+        myargv[1] = key;
+        myargv[2] = value;
+        redisContext *c = lookupRedisServerWithKey( p, key );
+        redisReply *reply = proxyCommandArgvList( p, c, 3, (const char **)myargv ); 
         if( call_count == 0 ) {
             replyAll = reply;
         } else {
@@ -178,103 +309,42 @@ void *msetPostProc(proxyContext *p, multiRequest *requests, int argc, char **arg
                 break;
             }
         }
+        call_count++;
     }
 
     return replyAll;
 }
 
-int findReplyPosition( const char *key, int argc, char **argv ) {
-    int ret = 0;
-    for( int i = 1; i < argc; i++ ) {
-        if( strcasecmp( key, argv[i] ) == 0 ) {
-            ret = i;
-            break;
-        }
-    }
-
-    return ret-1;
-}
-
-void *mgetPostProc(proxyContext *p, multiRequest *requests, int argc, char **argv, multiRequestInfo info) {
+void *mgetProc(proxyContext *p, int argc, char **argv, redisKeyInfo *keyInfo){
     redisReply *replyAll;
-    redisReply **element;
 
-    element = malloc( info.command_count * sizeof( redisReply * ) );
-    for( int i = 0; i < info.request_count; i++ ) {
-        redisContext *c = getRedisContext( p, i );
-        redisReply *reply = redisCommandArgvList( c, requests[i].argc, (const char **)requests[i].argv );
-        if( reply ){
-            for (int j = 1; j < requests[i].argc; j++ ) {
-                int idx = findReplyPosition( requests[i].argv[j], argc, argv );
-                element[idx] = reply->element[j-1];
-                reply->element[j-1] = NULL;
-            }
-
-            freeReplyObject(reply);
-        } 
-    }
+    int command_count = (argc-1)/keyInfo->keystep;
+    redisReply **element = malloc( command_count * sizeof( redisReply * ) );
+    if( !element )
+        return NULL;
 
     replyAll = createReplyObject(REDIS_REPLY_ARRAY);
-    if( replyAll ){
-        replyAll->elements = info.command_count;
-        replyAll->element = element;
+    if( !replyAll ){
+        free(element);
     }
 
-    return replyAll;
-}
+    char *myargv[2];
+    myargv[0] = (char *)"GET";
 
-void *eachKeyProc(proxyContext *p, int argc, char **argv, redisKeyInfo *keyInfo){
-    redisReply *replyAll;
-    multiRequest *requests;
-
-    multiRequestInfo info;
-    info.request_count = 0;
-    info.command_count = (argc-1)/keyInfo->keystep;
-    info.server_array = calloc( p->count, sizeof(int) );
-    if( info.server_array == NULL ) {
-        return NULL;
+    replyAll->elements = command_count;
+    for( int i = 0; i < command_count; i++ ) {
+        int keyIdx = 1+(i*keyInfo->keystep);
+        char *key = argv[keyIdx];
+        myargv[1] = key;
+        redisContext *c = lookupRedisServerWithKey( p, key );
+        redisReply *reply = proxyCommandArgvList( p, c, 2, (const char **)myargv ); 
+        if( reply == NULL ) {
+            reply = createReplyObject(REDIS_REPLY_NIL);
+        }
+        element[i] = reply;
     }
 
-    info.command_idx = malloc( info.command_count * sizeof(int) );
-    if( NULL == info.command_idx ) {
-        free( info.server_array );
-        return NULL;
-    }
-
-    for( int i = 0; i < info.command_count; i++ ) {
-        info.command_idx[i] = lookupRedisServerWithKey ( argv[1+(i*keyInfo->keystep)], p->count );        
-        info.server_array[ info.command_idx[i] ] = 1;
-    }
-
-    for( int i = 0; i < p->count; i++ ) {
-        if( info.server_array[i] > 0 ) {
-            info.request_count++;
-            info.server_array[i] = info.request_count;
-        } 
-    }
-
-    requests = calloc( info.request_count, sizeof(multiRequest) );
-    for( int i = 0; i < info.request_count; i++ ) {
-        requests[i].argv = calloc( info.command_count*keyInfo->keystep, sizeof( char * ) );
-        requests[i].argv[requests[i].argc++] = argv[0];
-    }
-
-    for( int i = 0; i < info.command_count; i++ ) {
-        int idx = info.server_array[ info.command_idx[i] ]-1;
-        requests[idx].idx = idx;
-        for( int j = 0; j < keyInfo->keystep; j++ ) {
-            requests[idx].argv[requests[idx].argc++] = argv[1+(i*keyInfo->keystep) +j];
-        }                
-        printArgv( requests[idx].argc, requests[idx].argv );
-    }
-     
-    replyAll = keyInfo->postproc( p, requests, argc, argv, info );
-    for( int i = 0; i < info.request_count; i++ ){
-        free(requests[i].argv);
-    }
-    free(requests);
-    free(info.server_array);
-    free(info.command_idx);
+    replyAll->element = element;
     return replyAll;
 }
 
@@ -287,14 +357,15 @@ void *sumIntegerKeyProc(proxyContext *p, int argc, char **argv, redisKeyInfo *ke
     if( replyAll ){
         for( int i = 0; i < p->count; i++ ){
             redisReply *reply;
-            c = getRedisContext( p, i );
-            reply = redisCommandArgvList( c, argc, (const char **)argv );
-            if( reply == NULL ) {
-                return NULL;
+            c = getRedisContextWithIdx( p, i );
+            reply = proxyCommandArgvList( p, c, argc, (const char **)argv );
+            int value = 0;
+            if( reply ) {
+                value = reply->integer;
+                freeReplyObject(reply);
             }
             
-            replyAll->integer += reply->integer; 
-            freeReplyObject(reply);
+            replyAll->integer += value;
         }
     }
     return replyAll;
@@ -307,19 +378,21 @@ void *allServerProc(proxyContext *p, int argc, char **argv, redisKeyInfo *keyInf
     
     for( int i = 0; i < p->count; i++ ){
         redisReply *reply;
-        c = getRedisContext( p, i );
-        reply = redisCommandArgvList( c, argc, (const char **)argv );
-        if( i == 0 ) {
-            replyAll = reply;
-        } else {
-            if( reply->type != REDIS_REPLY_ERROR ) {
-                freeReplyObject(reply); 
-            } else {
-                if( replyAll ) {
-                    freeReplyObject(replyAll);
-                } 
+        c = getRedisContextWithIdx( p, i );
+        reply = proxyCommandArgvList( p, c, argc, (const char **)argv );
+        if( reply ){
+            if( i == 0 ) {
                 replyAll = reply;
-                break;
+            } else {
+                if( reply->type != REDIS_REPLY_ERROR ) {
+                    freeReplyObject(reply); 
+                } else {
+                    if( replyAll ) {
+                        freeReplyObject(replyAll);
+                    } 
+                    replyAll = reply;
+                    break;
+                }
             }
         }
     }
@@ -335,7 +408,6 @@ void loadCommandTable(dict *commands) {
         { "setex", oneKeyProc,1,1,1,0,0},
         { "psetex", oneKeyProc,1,1,1,0,0},
         { "append", oneKeyProc,1,1,1,0,0},
-        { "strlen", oneKeyProc,1,1,1,0,0},
         { "exists", oneKeyProc,1,1,1,0,0},
         { "strlen", oneKeyProc,1,1,1,0,0},
         { "del", sumIntegerKeyProc,1,-1,1,0,0},
@@ -346,7 +418,7 @@ void loadCommandTable(dict *commands) {
         { "substr", oneKeyProc, 1,1,1,0,0},
         { "incr", oneKeyProc, 1,1,1,0,0},
         { "decr", oneKeyProc, 1,1,1,0,0},
-        { "mget", eachKeyProc, 1,-1,1,0,mgetPostProc},
+        { "mget", mgetProc, 1,-1,1,0,0},
         { "rpush", oneKeyProc, 1,1,1,0,0},
         { "lpush", oneKeyProc, 1,1,1,0,0},
         { "rpushx", oneKeyProc,1,1,1,0,0},
@@ -411,7 +483,7 @@ void loadCommandTable(dict *commands) {
         { "decrby",oneKeyProc,1,1,1,0,0},
         { "incrbyfloat",oneKeyProc,1,1,1,0,0},
         { "getset",oneKeyProc,1,1,1,0,0},
-        { "mset",eachKeyProc,1,-1,2,0,msetPostProc},
+        { "mset",msetProc,1,-1,2,0,0},
         { "msetnx",notsupportCommandProc,1,-1,2,0,0},
         { "randomkey",notsupportCommandProc,0,0,0,0,0},
         { "select",notsupportCommandProc,0,0,0,0,0},
@@ -469,7 +541,7 @@ void loadCommandTable(dict *commands) {
     for (int i = 0; i < numcommands; i++) {
         redisKeyInfo *c = keyInfos+i;
         int retval = dictAdd(commands, sdsnew(c->name), c);
-        if( 0 == retval ) {
+        if( 0 != retval ) {
             printf("Error: dictAdd: %s\n", c->name );
         }
     }

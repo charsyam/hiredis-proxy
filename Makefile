@@ -69,7 +69,7 @@ hiredis-example-libev: example-libev.c adapters/libev.h $(STLIBNAME)
 	$(CC) -o $@ $(REAL_CFLAGS) $(REAL_LDFLAGS) -lev example-libev.c $(STLIBNAME)
 
 hiredis-example-proxy: example-proxy.c $(STLIBNAME)
-	$(CC) -o $@ $(REAL_CFLAGS) $(REAL_LDFLAGS) example-proxy.c $(STLIBNAME)
+	$(CC) -o $@ $(REAL_CFLAGS) $(REAL_LDFLAGS) example-proxy.c $(STLIBNAME) -lm
 
 ifndef AE_DIR
 hiredis-example-ae:

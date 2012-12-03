@@ -688,6 +688,7 @@ int redisvFormatCommandArgList( char ***curargv, int *argc, const char *format, 
     int touched = 0; /* was the current argument touched? */
     char **newargv = NULL;
     int totlen = 0;
+    int commented = 0;
 
     /* Abort if there is not target to set */
     if (curargv == NULL || argc == NULL)
@@ -700,9 +701,24 @@ int redisvFormatCommandArgList( char ***curargv, int *argc, const char *format, 
         return -1;
 
     while(*c != '\0') {
-        if (*c != '%' || c[1] == '\0') {
-            if (*c == ' ') {
+        if (*c != '%' || commented == 1 || c[1] == '\0') {
+            if (*c == ' ' && commented == 0) {
                 if (touched) {
+                    newargv = realloc(*curargv,sizeof(char*)*((*argc)+1));
+                    if (newargv == NULL) goto err;
+                    *curargv = newargv;
+                    (*curargv)[(*argc)++] = curarg;
+                    totlen += bulklen(sdslen(curarg));
+
+                    /* curarg is put in argv so it can be overwritten. */
+                    curarg = sdsempty();
+                    if (curarg == NULL) goto err;
+                    touched = 0;
+                }
+            } else if ( *c == '"' ) {
+                commented = (commented) ? 0 : 1;
+
+                if( touched ){
                     newargv = realloc(*curargv,sizeof(char*)*((*argc)+1));
                     if (newargv == NULL) goto err;
                     *curargv = newargv;
@@ -853,6 +869,8 @@ int redisvFormatCommandArgList( char ***curargv, int *argc, const char *format, 
         c++;
     }
 
+    if( commented == 1 ) goto err;
+
     /* Add the last argument if needed */
     if (touched) {
         newargv = realloc(*curargv,sizeof(char*)*((*argc)+1));
@@ -893,6 +911,7 @@ int redisvFormatCommand(char **target, const char *format, va_list ap) {
     int argc = 0;
     int totlen = 0;
     int j;
+    int commented = 0;
 
     /* Abort if there is not target to set */
     if (target == NULL)
@@ -904,9 +923,24 @@ int redisvFormatCommand(char **target, const char *format, va_list ap) {
         return -1;
 
     while(*c != '\0') {
-        if (*c != '%' || c[1] == '\0') {
-            if (*c == ' ') {
+        if (*c != '%' || commented == 1 || c[1] == '\0') {
+            if (*c == ' ' && commented == 0) {
                 if (touched) {
+                    newargv = realloc(curargv,sizeof(char*)*(argc+1));
+                    if (newargv == NULL) goto err;
+                    curargv = newargv;
+                    curargv[argc++] = curarg;
+                    totlen += bulklen(sdslen(curarg));
+
+                    /* curarg is put in argv so it can be overwritten. */
+                    curarg = sdsempty();
+                    if (curarg == NULL) goto err;
+                    touched = 0;
+                }
+            } else if ( *c == '"' ) {
+                commented = (commented) ? 0 : 1;
+
+                if( touched ){
                     newargv = realloc(curargv,sizeof(char*)*(argc+1));
                     if (newargv == NULL) goto err;
                     curargv = newargv;
@@ -1057,6 +1091,8 @@ int redisvFormatCommand(char **target, const char *format, va_list ap) {
         c++;
     }
 
+    if (commented == 1) goto err;
+
     /* Add the last argument if needed */
     if (touched) {
         newargv = realloc(curargv,sizeof(char*)*(argc+1));
@@ -1179,7 +1215,7 @@ int redisFormatCommandArgvList(char **target, int argc, const char **argv) {
     /* Calculate number of bytes needed for the command */
     totlen = 1+intlen(argc)+2;
     for (j = 0; j < argc; j++) {
-        len = sdslen((sds)(argv[j]));
+        len = strlen(argv[j]);
         totlen += bulklen(len);
     }
 
@@ -1190,7 +1226,7 @@ int redisFormatCommandArgvList(char **target, int argc, const char **argv) {
 
     pos = sprintf(cmd,"*%d\r\n",argc);
     for (j = 0; j < argc; j++) {
-        len = sdslen((sds)(argv[j]));
+        len = strlen(argv[j]);
         pos += sprintf(cmd+pos,"$%zu\r\n",len);
         memcpy(cmd+pos,argv[j],len);
         pos += len;
