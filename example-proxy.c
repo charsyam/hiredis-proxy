@@ -22,6 +22,10 @@ int main(void) {
         exit(1);
     }
 
+    reply = proxyCommand(p,"AUTH %s","1234");
+    printf("AUTH: %s\n", reply->str);
+    freeReplyObject(reply);
+
     /* PING server */
     reply = proxyCommand(p,"PING");
     printf("PING: %s\n", reply->str);
@@ -31,45 +35,26 @@ int main(void) {
     printf("FLUSHALL: %s\n", reply->str);
     freeReplyObject(reply);
 
+    int i;
     /* Set a key using binary safe API */
-    reply = proxyCommand( p,"SET %s %s", "foo", "hello world");
-    printf("SET: %s\n", reply->str);
-    freeReplyObject(reply);
+    for( i = 0; i < 1000000; i++ ) {
+        reply = proxyCommand( p,"SET %s%d %s", "foo", i, "hello world");
+        if( reply ){
+            printf("SET: %s%d %s\n", "foo", i, reply->str);
+            freeReplyObject(reply);
+        }
+    }
 
-    reply = proxyCommand( p,"SET %s %s", "foo1", "hello");
-    printf("SET: %s\n", reply->str);
-    freeReplyObject(reply);
-
-    reply = proxyCommand( p,"SET %s %s", "foo2", "hello");
-    printf("SET: %s\n", reply->str);
-    freeReplyObject(reply);
-
-    reply = proxyCommand( p,"SET %s %s", "foo3", "hello");
-    printf("SET: %s\n", reply->str);
-    freeReplyObject(reply);
+    for( i = 0; i < 1000; i++ ) {
+        reply = proxyCommand( p,"GET %s%d", "foo", i);
+        if( reply ){
+            printf("GET: %s%d %s\n", "foo", i, reply->str);
+            freeReplyObject(reply);
+        }
+    }
 
     reply = proxyCommand( p, "SET %b %b", "bar", 3, "hello", 5);
     printf("SET (binary API): %s\n", reply->str);
-    freeReplyObject(reply);
-
-    reply = proxyCommand(p,"GET foo1");
-    printf("GET foo: %s\n", reply->str);
-    freeReplyObject(reply);
-
-    reply = proxyCommand(p,"GET foo2");
-    printf("GET foo: %s\n", reply->str);
-    freeReplyObject(reply);
-
-    reply = proxyCommand(p,"GET foo3");
-    printf("GET foo: %s\n", reply->str);
-    freeReplyObject(reply);
-
-    reply = proxyCommand(p,"GET foo");
-    printf("GET foo: %s\n", reply->str);
-    freeReplyObject(reply);
-
-    reply = proxyCommand(p,"GET bar");
-    printf("GET bar: %s\n", reply->str);
     freeReplyObject(reply);
 
     reply = proxyCommand(p,"dbsize");

@@ -496,7 +496,7 @@ void loadCommandTable(dict *commands) {
         { "pexpireat",notsupportCommandProc,1,1,1,0,0},
         { "keys",notsupportCommandProc,0,0,0,0,0},
         { "dbsize",sumIntegerKeyProc,0,0,0,0,0},
-        { "auth",notsupportCommandProc,0,0,0,0,0},
+        { "auth",allServerProc,0,0,0,0,0},
         { "ping",allServerProc,0,0,0,0,0},
         { "echo",notsupportCommandProc,0,0,0,0,0},
         { "save",notsupportCommandProc,0,0,0,0,0},
